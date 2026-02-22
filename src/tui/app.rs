@@ -5,10 +5,11 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{prelude::*, widgets::*};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
+use std::time::Instant;
 
 use crate::agent::{self, AgentOperations, CodingAgent};
 use crate::config::{GlobalConfig, MergedConfig, ProjectConfig, ThemeConfig};
@@ -120,6 +121,10 @@ struct AppState {
     hook_result_rx: Option<mpsc::Receiver<Result<(), String>>>,
     // Pending action to perform after hook succeeds
     pending_hook_action: Option<PendingHookAction>,
+    // Agent status cache: session_name -> (status, last_checked)
+    status_cache: HashMap<String, (super::status::SessionStatus, Instant)>,
+    // Spinner animation tick (incremented every event loop cycle)
+    spinner_tick: usize,
 }
 
 /// State for confirming move to Done
@@ -336,6 +341,8 @@ impl App {
                 hook_status_popup: None,
                 hook_result_rx: None,
                 pending_hook_action: None,
+                status_cache: HashMap::new(),
+                spinner_tick: 0,
             },
         };
 
@@ -439,6 +446,8 @@ impl App {
 
             // Periodically refresh session status
             self.refresh_sessions()?;
+
+            self.state.spinner_tick = self.state.spinner_tick.wrapping_add(1);
         }
 
         Ok(())
@@ -584,7 +593,10 @@ impl App {
                     break;
                 }
 
-                Self::draw_task_card(frame, task, card_area, is_selected, &state.config.theme);
+                let task_status = task.session_name.as_ref()
+                    .and_then(|s| state.status_cache.get(s))
+                    .map(|(status, _)| *status);
+                Self::draw_task_card(frame, task, card_area, is_selected, &state.config.theme, task_status, state.spinner_tick);
             }
 
             // Draw scrollbar if needed
@@ -1160,7 +1172,7 @@ impl App {
         shell_popup::render_shell_popup(popup, frame, popup_area, styled_lines, &colors);
     }
 
-    fn draw_task_card(frame: &mut Frame, task: &Task, area: Rect, is_selected: bool, theme: &ThemeConfig) {
+    fn draw_task_card(frame: &mut Frame, task: &Task, area: Rect, is_selected: bool, theme: &ThemeConfig, status: Option<super::status::SessionStatus>, spinner_tick: usize) {
         let border_style = if is_selected {
             Style::default().fg(hex_to_color(&theme.color_selected))
         } else {
@@ -1173,13 +1185,43 @@ impl App {
             Style::default().fg(hex_to_color(&theme.color_text)).bold()
         };
 
+        // Calculate indicator width for title truncation
+        let indicator_width: usize = match status {
+            Some(super::status::SessionStatus::Unknown) | None => 0,
+            Some(_) => 2, // "● " is 2 display columns
+        };
+
         // Truncate title to fit (char-safe for UTF-8)
-        let max_title_len = area.width.saturating_sub(4) as usize;
+        let max_title_len = (area.width.saturating_sub(4) as usize).saturating_sub(indicator_width);
         let title: String = if task.title.chars().count() > max_title_len {
             let truncated: String = task.title.chars().take(max_title_len.saturating_sub(3)).collect();
             format!("{}...", truncated)
         } else {
             task.title.clone()
+        };
+
+        // Build title line with optional colored status indicator
+        let title_spans: Line = if let Some(status) = status {
+            use super::status::SessionStatus;
+            let (indicator, color): (String, Option<Color>) = match status {
+                SessionStatus::Active => {
+                    let frame_char = super::status::SPINNER_FRAMES[spinner_tick % super::status::SPINNER_FRAMES.len()];
+                    (format!("{} ", frame_char), Some(Color::Green))
+                }
+                SessionStatus::Idle => ("○ ".to_string(), Some(Color::Yellow)),
+                SessionStatus::Exited => ("✗ ".to_string(), Some(Color::Red)),
+                SessionStatus::Unknown => (String::new(), None),
+            };
+            if let Some(color) = color {
+                Line::from(vec![
+                    Span::styled(indicator, Style::default().fg(color)),
+                    Span::styled(title, title_style),
+                ])
+            } else {
+                Line::from(Span::styled(title, title_style))
+            }
+        } else {
+            Line::from(Span::styled(title, title_style))
         };
 
         let border_type = if is_selected {
@@ -1196,7 +1238,7 @@ impl App {
         frame.render_widget(card_block, area);
 
         // Title line
-        let title_line = Paragraph::new(title).style(title_style);
+        let title_line = Paragraph::new(title_spans);
         let title_area = Rect {
             x: inner.x,
             y: inner.y,
@@ -1496,18 +1538,8 @@ impl App {
 
     fn run_hook_async(&mut self, hook: &str, task: &Task, action: PendingHookAction) {
         let hook_cmd = hook.to_string();
-        let working_dir = task.worktree_path.clone()
-            .or_else(|| self.state.project_path.as_ref().map(|p| p.to_string_lossy().to_string()))
-            .unwrap_or_else(|| ".".to_string());
-
-        let env_vars: Vec<(String, String)> = vec![
-            ("AGTX_TASK_ID".to_string(), task.id.clone()),
-            ("AGTX_TASK_TITLE".to_string(), task.title.clone()),
-            ("AGTX_BRANCH_NAME".to_string(), task.branch_name.clone().unwrap_or_default()),
-            ("AGTX_WORKTREE_PATH".to_string(), task.worktree_path.clone().unwrap_or_default()),
-            ("AGTX_PROJECT_PATH".to_string(), self.state.project_path.as_ref()
-                .map(|p| p.to_string_lossy().to_string()).unwrap_or_default()),
-        ];
+        let working_dir = resolve_hook_working_dir(task, self.state.project_path.as_deref());
+        let env_vars = build_hook_env_vars(task, self.state.project_path.as_deref());
 
         self.state.hook_status_popup = Some(HookStatusPopup {
             message: format!("Running: {}", hook_cmd),
@@ -2398,19 +2430,7 @@ impl App {
         if let Some(new_status) = next_status {
             // Create worktree and tmux window when moving from Backlog to Explore
             if current_status == TaskStatus::Backlog && new_status == TaskStatus::Explore {
-                // Build the prompt from task title and description
-                // Instruct agent to explore codebase first
-                let task_content = if let Some(desc) = &task.description {
-                    format!("{}\n\n{}", task.title, desc)
-                } else {
-                    task.title.clone()
-                };
-                let prompt = format!(
-                    "Explore the codebase for this task: {}\n\n\
-                     Understand the problem space, look at relevant files, and discuss potential approaches. \
-                     Don't make any changes yet — we'll plan next.",
-                    task_content
-                );
+                let prompt = build_explore_prompt(&task.title, task.description.as_deref());
 
                 let target = setup_task_worktree(
                     &mut task,
@@ -2594,18 +2614,7 @@ impl App {
             return Ok(());
         }
 
-        // Build prompt - skip Explore, go straight to planning
-        let task_content = if let Some(desc) = &task.description {
-            format!("{}\n\n{}", task.title, desc)
-        } else {
-            task.title.clone()
-        };
-        let prompt = format!(
-            "Task: {}\n\nPlease analyze this task and create a detailed implementation plan. \
-             List the files you'll need to modify and the changes you'll make. \
-             Wait for my approval before making any changes.",
-            task_content
-        );
+        let prompt = build_planning_prompt(&task.title, task.description.as_deref());
 
         let target = setup_task_worktree(
             &mut task,
@@ -2689,19 +2698,7 @@ impl App {
 
         let flags = self.state.config.agent_flags.get(&agent.name).cloned().unwrap_or_default();
 
-        let cmd = if agent.name == "claude" {
-            let mut parts = vec!["claude".to_string()];
-            parts.extend(flags.iter().cloned());
-            parts.extend(["--resume".to_string(), task.id.clone()]);
-            parts.join(" ")
-        } else {
-            let prompt = format!(
-                "Resuming task: {}\n\nPlease continue working on this task. \
-                 Check the git log and diff to understand what's been done so far.",
-                task.title
-            );
-            agent.build_interactive_command(&prompt, &flags)
-        };
+        let cmd = build_respawn_command(&agent, &task.id, &task.title, &flags);
 
         let session_name = task.session_name.as_ref()
             .ok_or_else(|| anyhow::anyhow!("No session name for task"))?;
@@ -2723,11 +2720,10 @@ impl App {
         if let Some(task) = self.state.board.selected_task().cloned() {
             if let Some(ref session_name) = task.session_name {
                 let window_alive = self.state.tmux_ops.window_exists(session_name).unwrap_or(false);
+                let action = determine_open_task_action(window_alive, task.worktree_path.is_some());
 
-                if !window_alive {
-                    if task.worktree_path.is_some() {
-                        self.respawn_agent_session(&task)?;
-                    } else {
+                match action {
+                    OpenTaskAction::ClearSession => {
                         if let Some(db) = &self.state.db {
                             let mut updated = task.clone();
                             updated.session_name = None;
@@ -2737,6 +2733,10 @@ impl App {
                         self.refresh_tasks()?;
                         return Ok(());
                     }
+                    OpenTaskAction::Respawn => {
+                        self.respawn_agent_session(&task)?;
+                    }
+                    OpenTaskAction::OpenPopup => {}
                 }
 
                 let window_name = session_name.split(':').nth(1).unwrap_or(session_name);
@@ -2798,7 +2798,59 @@ impl App {
     }
 
     fn refresh_sessions(&mut self) -> Result<()> {
-        // TODO: Periodically check tmux sessions and update task status
+        use super::status::{detect_session_status, SessionStatus};
+
+        let now = Instant::now();
+        let ttl = std::time::Duration::from_secs(2);
+
+        // Collect running tasks with session names
+        let running_tasks: Vec<(String, String)> = self.state.board.tasks.iter()
+            .filter(|t| t.status == TaskStatus::Running)
+            .filter_map(|t| {
+                t.session_name.as_ref().map(|s| (t.id.clone(), s.clone()))
+            })
+            .collect();
+
+        let mut tasks_to_review = Vec::new();
+
+        for (task_id, session_name) in &running_tasks {
+            // Check cache TTL — skip detection if still fresh
+            if let Some((_cached_status, checked_at)) = self.state.status_cache.get(session_name) {
+                if now.duration_since(*checked_at) < ttl {
+                    continue;
+                }
+            }
+
+            let status = detect_session_status(session_name, self.state.tmux_ops.as_ref());
+            self.state.status_cache.insert(session_name.clone(), (status, now));
+
+            if status == SessionStatus::Idle {
+                tasks_to_review.push(task_id.clone());
+            }
+        }
+
+        // Prune stale cache entries (sessions no longer in running tasks)
+        let active_sessions: std::collections::HashSet<&String> = running_tasks.iter().map(|(_, s)| s).collect();
+        self.state.status_cache.retain(|k, _| active_sessions.contains(k));
+
+        // Auto-move idle tasks to Review
+        for task_id in &tasks_to_review {
+            if let Some(db) = &self.state.db {
+                if let Ok(Some(mut task)) = db.get_task(task_id) {
+                    if task.status == TaskStatus::Running {
+                        task.status = TaskStatus::Review;
+                        task.updated_at = chrono::Utc::now();
+                        let _ = db.update_task(&task);
+                    }
+                }
+            }
+        }
+
+        // Refresh board only if tasks were actually moved
+        if !tasks_to_review.is_empty() {
+            self.refresh_tasks()?;
+        }
+
         Ok(())
     }
 
@@ -2842,6 +2894,91 @@ impl Drop for App {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+    }
+}
+
+/// What action to take when opening a task with a session
+#[derive(Debug, PartialEq)]
+enum OpenTaskAction {
+    Respawn,
+    ClearSession,
+    OpenPopup,
+}
+
+/// Determine the action to take when opening a task
+fn determine_open_task_action(window_alive: bool, has_worktree: bool) -> OpenTaskAction {
+    if window_alive {
+        OpenTaskAction::OpenPopup
+    } else if has_worktree {
+        OpenTaskAction::Respawn
+    } else {
+        OpenTaskAction::ClearSession
+    }
+}
+
+/// Resolve the working directory for hook execution
+fn resolve_hook_working_dir(task: &Task, project_path: Option<&Path>) -> String {
+    task.worktree_path.clone()
+        .or_else(|| project_path.map(|p| p.to_string_lossy().to_string()))
+        .unwrap_or_else(|| ".".to_string())
+}
+
+/// Build environment variables for hook execution
+fn build_hook_env_vars(task: &Task, project_path: Option<&Path>) -> Vec<(String, String)> {
+    vec![
+        ("AGTX_TASK_ID".to_string(), task.id.clone()),
+        ("AGTX_TASK_TITLE".to_string(), task.title.clone()),
+        ("AGTX_BRANCH_NAME".to_string(), task.branch_name.clone().unwrap_or_default()),
+        ("AGTX_WORKTREE_PATH".to_string(), task.worktree_path.clone().unwrap_or_default()),
+        ("AGTX_PROJECT_PATH".to_string(), project_path
+            .map(|p| p.to_string_lossy().to_string()).unwrap_or_default()),
+    ]
+}
+
+/// Build the prompt for exploring a task's codebase (Backlog → Explore)
+fn build_explore_prompt(title: &str, description: Option<&str>) -> String {
+    let task_content = if let Some(desc) = description {
+        format!("{}\n\n{}", title, desc)
+    } else {
+        title.to_string()
+    };
+    format!(
+        "Explore the codebase for this task: {}\n\n\
+         Understand the problem space, look at relevant files, and discuss potential approaches. \
+         Don't make any changes yet — we'll plan next.",
+        task_content
+    )
+}
+
+/// Build the prompt for planning a task (Backlog → Planning skip)
+fn build_planning_prompt(title: &str, description: Option<&str>) -> String {
+    let task_content = if let Some(desc) = description {
+        format!("{}\n\n{}", title, desc)
+    } else {
+        title.to_string()
+    };
+    format!(
+        "Task: {}\n\nPlease analyze this task and create a detailed implementation plan. \
+         List the files you'll need to modify and the changes you'll make. \
+         Wait for my approval before making any changes.",
+        task_content
+    )
+}
+
+/// Build the shell command to respawn an agent session
+fn build_respawn_command(agent: &agent::Agent, task_id: &str, task_title: &str, flags: &[String]) -> String {
+    if agent.name == "claude" {
+        let mut parts = vec!["claude".to_string()];
+        parts.extend(flags.iter().cloned());
+        parts.extend(["--resume".to_string(), task_id.to_string()]);
+        parts.join(" ")
+    } else {
+        let prompt = format!(
+            "Resuming task: {}\n\nPlease continue working on this task. \
+             Check the git log and diff to understand what's been done so far.",
+            task_title
+        );
+        agent.build_interactive_command(&prompt, flags)
     }
 }
 
